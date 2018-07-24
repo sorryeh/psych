@@ -234,6 +234,18 @@ module Psych
   NOT_GIVEN = Object.new
   private_constant :NOT_GIVEN
 
+  private_class_method def self.enforce_whitelist_safety(unsafe, classes: [], symbols: [], with_ruby_aliases: false)
+    class_loader = ClassLoader::Restricted.new(classes.map(&:to_s), symbols.map(&:to_s))
+    scanner = ScalarScanner.new(class_loader)
+    visitor = if with_ruby_aliases
+                Visitors::ToRuby.new(scanner, class_loader)
+              else
+                Visitors::NoAliasRuby.new(scanner, class_loader)
+              end
+    safe_result = visitor.accept(unsafe)
+    safe_result
+  end
+
   ###
   # Load +yaml+ in to a Ruby data structure.  If multiple documents are
   # provided, the object contained in the first document will be returned.
@@ -339,17 +351,9 @@ module Psych
     result = parse(yaml, filename: filename)
     return fallback unless result
 
-    class_loader = ClassLoader::Restricted.new(whitelist_classes.map(&:to_s),
-                                               whitelist_symbols.map(&:to_s))
-    scanner      = ScalarScanner.new class_loader
-    visitor = if aliases
-                Visitors::ToRuby.new scanner, class_loader
-              else
-                Visitors::NoAliasRuby.new scanner, class_loader
-              end
-    result = visitor.accept result
-    symbolize_names!(result) if symbolize_names
-    result
+    safe_result = enforce_whitelist_safety(result, classes: whitelist_classes, symbols: whitelist_symbols, with_ruby_aliases: aliases)
+    symbolize_names!(safe_result) if symbolize_names
+    safe_result
   end
 
   ###
@@ -404,6 +408,11 @@ module Psych
     Psych::Parser.new(TreeBuilder.new)
   end
 
+  private_class_method def self.parse_stream_with_block(yaml, filename: nil, &block)
+    parser = Psych::Parser.new(Handlers::DocumentStream.new(&block))
+    parser.parse yaml, filename
+  end
+
   ###
   # Parse a YAML string in +yaml+.  Returns the Psych::Nodes::Stream.
   # This method can handle multiple YAML documents contained in +yaml+.
@@ -438,14 +447,11 @@ module Psych
       filename = legacy_filename
     end
 
-    if block_given?
-      parser = Psych::Parser.new(Handlers::DocumentStream.new(&block))
-      parser.parse yaml, filename
-    else
-      parser = self.parser
-      parser.parse yaml, filename
-      parser.handler.root
-    end
+    return parse_stream_with_block(yaml, filename: filename, &block) if block_given?
+
+    parser = self.parser
+    parser.parse yaml, filename
+    parser.handler.root
   end
 
   ###
@@ -548,11 +554,28 @@ module Psych
                  yield node.to_ruby
                end
              else
-               parse_stream(yaml, filename: filename).children.map(&:to_ruby)
+               parse_stream(yaml, filename: filename).to_ruby
              end
 
     return fallback if result.is_a?(Array) && result.empty?
     result
+  end
+
+  ###
+  # Safely load multiple documents given in +yaml+. Returns the parsed documents
+  # as a list. If a block is given, each document will be converted to Ruby
+  # and passed to the block during parsing.
+  #
+  # Safety provided by +safe_load_stream+ is documented at +safe_load+, see it's documentation
+  # for details on passthrough +whitelist_classes+, +whitelist_symbols+, +aliases+ and +symbolize_names+
+  def self.safe_load_stream(yaml, whitelist_classes: [], whitelist_symbols: [], aliases: false, filename: nil, fallback: [], symbolize_names: false, &block)
+    result = parse_stream(yaml, filename: filename, &block)
+    safe_result = enforce_whitelist_safety(result, classes: whitelist_classes, symbols: whitelist_symbols, with_ruby_aliases: aliases)
+
+    return fallback if safe_result.is_a?(Array) && safe_result.empty?
+
+    symbolize_names!(safe_result) if symbolize_names
+    safe_result
   end
 
   ###
@@ -563,6 +586,23 @@ module Psych
     File.open(filename, 'r:bom|utf-8') { |f|
       self.load f, filename: filename, fallback: fallback
     }
+  end
+
+  ###
+  # Safely load the document contained in +filename+. Returns the yaml contained in
+  # +filename+ as a Ruby object, or if the file is empty, it returns
+  # the specified +fallback+ return value, which defaults to +false+.
+  # Safety provided by +safe_load+ method, see documentation for details
+  # on +whitelist_classes+, +whitelist_symbols+, +aliases+ and +symbolize_names+
+  def self.safe_load_file(filename, whitelist_classes: [], whitelist_symbols: [], aliases: false, fallback: false, symbolize_names: false)
+    File.open(filename, 'r:bom|utf-8') do |f|
+      safe_load(
+        f,
+        whitelist_classes: whitelist_classes, whitelist_symbols: whitelist_symbols,
+        aliases: aliases, filename: filename,
+        fallback: fallback, symbolize_names: symbolize_names
+      )
+    end
   end
 
   # :stopdoc:
